@@ -1,0 +1,130 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  lint_and_test:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: db_simuseum
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.2
+          extensions: mbstring, xml, mysql
+          ini-values: memory_limit=2G
+          coverage: none
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v3
+        with:
+          path: vendor
+          key: composer-${{ runner.os }}-${{ hashFiles('composer.lock') }}
+          restore-keys: |
+            composer-${{ runner.os }}-
+
+      - name: Validate Composer configuration
+        run: composer validate --strict
+
+      - name: Clear Composer cache
+        run: composer clear-cache
+
+      - name: Install Composer dependencies
+        run: composer install --no-progress --prefer-dist --optimize-autoloader
+
+      - name: Ensure vendor directory exists
+        run: test -d vendor || (echo "Vendor directory not found!" && exit 1)
+
+      - name: Copy .env file
+        run: cp .env.example .env
+
+      - name: Update .env file for testing
+        run: |
+          sed -i 's/DB_CONNECTION=.*/DB_CONNECTION=mysql/' .env
+          sed -i 's/DB_HOST=.*/DB_HOST=127.0.0.1/' .env
+          sed -i 's/DB_PORT=.*/DB_PORT=3306/' .env
+          sed -i 's/DB_DATABASE=.*/DB_DATABASE=db_simuseum/' .env
+          sed -i 's/DB_USERNAME=.*/DB_USERNAME=root/' .env
+          sed -i 's/DB_PASSWORD=.*/DB_PASSWORD=root/' .env
+
+      - name: Generate application key
+        run: php artisan key:generate
+
+      - name: Clear config cache
+        run: php artisan config:clear
+
+      - name: Wait for MySQL to be ready
+        run: |
+          for i in {1..30}; do
+            if mysqladmin ping -h 127.0.0.1 --silent; then
+              echo "MySQL is ready"
+              break
+            fi
+            echo "Waiting for MySQL..."
+            sleep 2
+          done
+          if ! mysqladmin ping -h 127.0.0.1 --silent; then
+            echo "MySQL failed to start!"
+            exit 1
+          fi
+
+      - name: Run migrations and seed database
+        run: php artisan migrate:fresh --seed --force
+
+      - name: Fix coding style with Laravel Pint
+        run: php vendor/bin/pint
+
+      - name: Run Laravel Pint (Code Linting)
+        run: php vendor/bin/pint --test
+
+      - name: Debug PHPStan Path
+        run: ls -lah vendor/bin/
+
+      - name: Cache PHPStan results
+        uses: actions/cache@v3
+        with:
+          path: .phpstan.cache
+          key: phpstan-${{ runner.os }}-${{ hashFiles('composer.lock') }}
+          restore-keys: |
+            phpstan-${{ runner.os }}-
+
+      - name: Run PHPStan (Static Analysis)
+        run: |
+          if [ -f vendor/bin/phpstan ]; then
+            php vendor/bin/phpstan analyse app/ routes/ database/ --level=5 --memory-limit=1G || (echo "PHPStan analysis failed!" && exit 1)
+          else
+            echo "PHPStan not found! Skipping analysis."
+          fi
+
+      - name: Run PHPUnit tests
+        env:
+          DB_CONNECTION: mysql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_DATABASE: db_simuseum
+          DB_USERNAME: root
+          DB_PASSWORD: root
+        run: php artisan test
